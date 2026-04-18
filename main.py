@@ -398,6 +398,8 @@ def safe_float(value: Any) -> Optional[float]:
         return None
     text = text.replace("%", "").replace("€", "").replace(",", ".")
     text = re.sub(r"[^0-9.\-+]", "", text)
+    while text.endswith(".") and text not in {".", "-.", "+."}:
+        text = text[:-1]
     if text in {"", ".", "-", "+"}:
         return None
     try:
@@ -1018,11 +1020,15 @@ def retrieve_fedna_snippets(manual_entries: List[Dict[str, Any]], species: str, 
 def parse_query_constraints(query: str, available_nutrients: List[str]) -> Dict[str, Any]:
     query_norm = normalize_ascii(query).lower()
     nutrient_constraints: Dict[str, Dict[str, Any]] = {}
+    nutrient_preferences: Dict[str, Dict[str, Any]] = {}
 
     synonym_pairs = sorted(QUERY_NUTRIENT_SYNONYMS.items(), key=lambda item: len(item[0]), reverse=True)
+    prioritization_words = ["prioriza", "priorizando", "priorizar", "maximiza", "maximizar"]
+
     for raw_synonym, nutrient_code in synonym_pairs:
         synonym = normalize_ascii(raw_synonym).lower()
-        if synonym not in query_norm:
+        synonym_present = re.search(rf"(?<![a-z0-9]){re.escape(synonym)}(?![a-z0-9])", query_norm)
+        if not synonym_present:
             continue
 
         range_pattern = re.compile(
@@ -1048,71 +1054,124 @@ def parse_query_constraints(query: str, available_nutrients: List[str]) -> Dict[
             low = safe_float(range_match.group(1))
             high = safe_float(range_match.group(2))
             if low is not None and high is not None:
-                nutrient_constraints[nutrient_code] = {"kind": "range", "min": min(low, high), "max": max(low, high), "weight": 2.4}
+                nutrient_constraints[nutrient_code] = {
+                    "kind": "range",
+                    "min": min(low, high),
+                    "max": max(low, high),
+                    "weight": 2.6,
+                }
                 matched = True
         if matched:
             continue
+
         comp_match = comp_pattern.search(query_norm)
         if comp_match:
             sign = comp_match.group(1)
             value = safe_float(comp_match.group(2))
             if value is not None:
                 if sign in {">", ">="}:
-                    nutrient_constraints[nutrient_code] = {"kind": "min", "value": value, "weight": 2.4}
+                    nutrient_constraints[nutrient_code] = {"kind": "min", "value": value, "weight": 2.6}
                 elif sign in {"<", "<="}:
-                    nutrient_constraints[nutrient_code] = {"kind": "max", "value": value, "weight": 2.4}
+                    nutrient_constraints[nutrient_code] = {"kind": "max", "value": value, "weight": 2.6}
                 else:
-                    nutrient_constraints[nutrient_code] = {"kind": "target", "value": value, "tol": max(abs(value) * 0.08, 0.1), "weight": 2.4}
+                    nutrient_constraints[nutrient_code] = {
+                        "kind": "target",
+                        "value": value,
+                        "tol": max(abs(value) * 0.08, 0.1),
+                        "weight": 2.6,
+                    }
                 matched = True
         if matched:
             continue
+
         min_match = min_pattern.search(query_norm)
         if min_match:
             value = safe_float(min_match.group(1))
             if value is not None:
-                nutrient_constraints[nutrient_code] = {"kind": "min", "value": value, "weight": 2.4}
+                nutrient_constraints[nutrient_code] = {"kind": "min", "value": value, "weight": 2.6}
                 matched = True
         if matched:
             continue
+
         max_match = max_pattern.search(query_norm)
         if max_match:
             value = safe_float(max_match.group(1))
             if value is not None:
-                nutrient_constraints[nutrient_code] = {"kind": "max", "value": value, "weight": 2.4}
+                nutrient_constraints[nutrient_code] = {"kind": "max", "value": value, "weight": 2.6}
+                matched = True
+        if matched:
+            continue
 
-    # Permitir referencias directas al código canónico presente en el Excel.
+        higher_pref_patterns = [
+            rf"(?:alto en|alta en|rico en|rica en|ricos en|ricas en|mas|más|mayor)\s+{re.escape(synonym)}",
+            rf"{re.escape(synonym)}\s+(?:alto|alta|elevado|elevada|mayor)",
+            rf"(?:{'|'.join(prioritization_words)})[^.\n]*{re.escape(synonym)}",
+        ]
+        lower_pref_patterns = [
+            rf"(?:bajo en|baja en|menos|menor|minimiza|minimizar|reducir|reducido en)\s+{re.escape(synonym)}",
+            rf"{re.escape(synonym)}\s+(?:bajo|baja|reducido|reducida|menor)",
+        ]
+
+        if any(re.search(pattern, query_norm, flags=re.IGNORECASE) for pattern in higher_pref_patterns):
+            nutrient_preferences[nutrient_code] = {"kind": "preference_max", "weight": 1.5}
+            continue
+        if any(re.search(pattern, query_norm, flags=re.IGNORECASE) for pattern in lower_pref_patterns):
+            nutrient_preferences[nutrient_code] = {"kind": "preference_min", "weight": 1.5}
+
     for nutrient_code in available_nutrients:
         code_norm = normalize_ascii(nutrient_code).lower()
-        comp_match = re.search(rf"{re.escape(code_norm)}\s*(>=|<=|>|<|=)\s*([0-9.,]+)", query_norm)
+        comp_match = re.search(rf"(?<![a-z0-9]){re.escape(code_norm)}(?![a-z0-9])\s*(>=|<=|>|<|=)\s*([0-9.,]+)", query_norm)
         if comp_match:
             sign = comp_match.group(1)
             value = safe_float(comp_match.group(2))
             if value is not None:
                 if sign in {">", ">="}:
-                    nutrient_constraints[nutrient_code] = {"kind": "min", "value": value, "weight": 2.4}
+                    nutrient_constraints[nutrient_code] = {"kind": "min", "value": value, "weight": 2.6}
                 elif sign in {"<", "<="}:
-                    nutrient_constraints[nutrient_code] = {"kind": "max", "value": value, "weight": 2.4}
+                    nutrient_constraints[nutrient_code] = {"kind": "max", "value": value, "weight": 2.6}
                 else:
-                    nutrient_constraints[nutrient_code] = {"kind": "target", "value": value, "tol": max(abs(value) * 0.08, 0.1), "weight": 2.4}
+                    nutrient_constraints[nutrient_code] = {
+                        "kind": "target",
+                        "value": value,
+                        "tol": max(abs(value) * 0.08, 0.1),
+                        "weight": 2.6,
+                    }
 
     price_max = None
     price_match = re.search(r"(?:precio|coste|costo|cost|eur|€)\s*(?:maximo|maximo de|máximo de|<|<=|hasta|tope)?\s*([0-9.,]+)", query_norm)
     if price_match:
         price_max = safe_float(price_match.group(1))
 
-    prefer_low_price = any(keyword in query_norm for keyword in ["barato", "economico", "económico", "menor precio", "mas barato", "más barato"])
+    prefer_low_price = any(
+        keyword in query_norm
+        for keyword in ["barato", "economico", "económico", "menor precio", "mas barato", "más barato", "precio bajo"]
+    )
+
+
+    if "energia alta" in query_norm or "energía alta" in query.lower() or "energia elevada" in query_norm:
+        for energy_code in ["NE_SW", "ME_SW", "EMAN", "EMA", "EM", "UFL", "UFC"]:
+            if energy_code in available_nutrients and energy_code not in nutrient_constraints and energy_code not in nutrient_preferences:
+                nutrient_preferences[energy_code] = {"kind": "preference_max", "weight": 1.5}
+                break
+    if "energia baja" in query_norm or "energía baja" in query.lower():
+        for energy_code in ["NE_SW", "ME_SW", "EMAN", "EMA", "EM", "UFL", "UFC"]:
+            if energy_code in available_nutrients and energy_code not in nutrient_constraints and energy_code not in nutrient_preferences:
+                nutrient_preferences[energy_code] = {"kind": "preference_min", "weight": 1.5}
+                break
 
     include_ingredients = extract_ingredient_terms(query_norm, mode="include")
     exclude_ingredients = extract_ingredient_terms(query_norm, mode="exclude")
+    name_terms = extract_name_terms_from_query(query_norm, available_nutrients)
 
     return {
         "nutrient_constraints": nutrient_constraints,
+        "nutrient_preferences": nutrient_preferences,
         "price_max": price_max,
         "prefer_low_price": prefer_low_price,
         "include_ingredients": include_ingredients,
         "exclude_ingredients": exclude_ingredients,
+        "name_terms": name_terms,
     }
-
 
 
 def extract_ingredient_terms(query_norm: str, mode: str = "include") -> List[str]:
@@ -1121,17 +1180,99 @@ def extract_ingredient_terms(query_norm: str, mode: str = "include") -> List[str
     else:
         patterns = [r"con\s+([a-z0-9_\- ]+)", r"incluir\s+([a-z0-9_\- ]+)", r"rico en\s+([a-z0-9_\- ]+)"]
 
+    nutrient_term_tokens = set()
+    for synonym in QUERY_NUTRIENT_SYNONYMS:
+        nutrient_term_tokens.update(tokenize(synonym))
+
+    blocked_tokens = nutrient_term_tokens | {
+        "alto", "alta", "altos", "altas", "bajo", "baja", "bajos", "bajas",
+        "precio", "barato", "economico", "económico", "energia", "energía",
+    }
+
     terms: List[str] = []
     for pattern in patterns:
         for match in re.finditer(pattern, query_norm):
             fragment = match.group(1).strip()
             fragment = re.split(r"[,.;]|\s+que\s+|\s+para\s+|\s+y\s+|\s+o\s+", fragment)[0].strip()
-            if len(fragment) >= 3:
-                terms.append(fragment)
+            fragment_tokens = tokenize(fragment)
+            if len(fragment) < 3:
+                continue
+            if not fragment_tokens:
+                continue
+            if all(tok in blocked_tokens for tok in fragment_tokens):
+                continue
+            terms.append(fragment)
     return list(dict.fromkeys(terms))
 
 
+def extract_name_terms_from_query(query_norm: str, available_nutrients: List[str]) -> List[str]:
+    nutrient_tokens = set()
+    for synonym in QUERY_NUTRIENT_SYNONYMS:
+        nutrient_tokens.update(tokenize(synonym))
+    available_tokens = set()
+    for nutrient in available_nutrients:
+        available_tokens.update(tokenize(nutrient))
+        available_tokens.update(tokenize(nutrient_label(nutrient)))
 
+    generic_tokens = set(STOPWORDS) | nutrient_tokens | available_tokens | {
+        "fedna", "top", "mejor", "mejores", "busca", "buscar", "dame", "quiero",
+        "necesito", "recomienda", "recomendacion", "recomendación", "explica", "comparar",
+        "compara", "prioriza", "priorizando", "priorizar", "cumple", "cumplan", "cumpla",
+        "requisito", "requisitos", "nivel", "niveles", "mayor", "menor", "alto", "alta",
+        "bajo", "baja", "economico", "económico", "barato", "cara", "caro", "precio", "coste",
+        "costo", "excel", "chat", "selector", "rumiantes", "porcino", "avicultura", "aves",
+        "carne", "leche", "recria", "recría", "gestacion", "gestación", "produccion", "producción",
+        "objetivo", "objetivos", "usar", "utiliza", "utilizar", "solo", "solamente", "piensos", "formula", "formulas", "filtra", "filtrar", "posible", "posibles",
+    }
+
+    extracted: List[str] = []
+    for tok in tokenize(query_norm):
+        tok = tok.strip(".-_ ")
+        if not tok:
+            continue
+        if tok in generic_tokens:
+            continue
+        if re.fullmatch(r"[0-9.]+", tok):
+            continue
+        extracted.append(tok)
+    return list(dict.fromkeys(extracted))
+
+
+def default_preference_kind(nutrient: str) -> str:
+    lower_is_better = {"FIBRA_BR", "FAD", "LAD", "NA", "CL"}
+    if nutrient in lower_is_better:
+        return "preference_min"
+    return "preference_max"
+
+
+def value_satisfies_rule(value: Any, rule: Dict[str, Any]) -> bool:
+    numeric_value = safe_float(value)
+    if numeric_value is None:
+        return False
+    kind = rule.get("kind")
+    if kind == "min":
+        return numeric_value >= float(rule["value"])
+    if kind == "max":
+        return numeric_value <= float(rule["value"])
+    if kind == "target":
+        tol = max(float(rule.get("tol", abs(float(rule["value"])) * 0.08)), 1e-6)
+        return abs(numeric_value - float(rule["value"])) <= tol
+    if kind == "range":
+        return float(rule["min"]) <= numeric_value <= float(rule["max"])
+    return True
+
+
+def feed_search_blob(details: Dict[str, Any], feed_name: str) -> str:
+    ingredients = details.get(feed_name, {}).get("ingredients", [])
+    ingredient_names = " ".join(str(item.get("ingredient_name", "")) for item in ingredients)
+    return normalize_ascii(f"{feed_name} {ingredient_names}").lower()
+
+
+def text_match_ratio(text_blob: str, name_terms: List[str]) -> float:
+    if not name_terms:
+        return 0.0
+    hits = sum(1 for term in name_terms if term in text_blob)
+    return hits / max(len(name_terms), 1)
 def merge_requirements(
     profile: Dict[str, Any],
     query_constraints: Dict[str, Any],
@@ -1139,19 +1280,25 @@ def merge_requirements(
     available_nutrients: List[str],
 ) -> Dict[str, Dict[str, Any]]:
     available_set = set(available_nutrients)
-    selected_set = set(selected_nutrients)
-
-    merged = {nutrient: rule.copy() for nutrient, rule in profile.get("requirements", {}).items() if nutrient in available_set}
-
-    if selected_set:
-        merged = {nutrient: rule for nutrient, rule in merged.items() if nutrient in selected_set}
+    merged: Dict[str, Dict[str, Any]] = {}
 
     for nutrient, rule in query_constraints.get("nutrient_constraints", {}).items():
         if nutrient in available_set:
             merged[nutrient] = rule.copy()
 
-    return merged
+    for nutrient, rule in query_constraints.get("nutrient_preferences", {}).items():
+        if nutrient in available_set and nutrient not in merged:
+            merged[nutrient] = rule.copy()
 
+    if not merged:
+        for nutrient in selected_nutrients:
+            if nutrient in available_set:
+                merged[nutrient] = {
+                    "kind": default_preference_kind(nutrient),
+                    "weight": 1.0,
+                    "fallback": True,
+                }
+    return merged
 
 
 def ingredient_set_for_feed(details: Dict[str, Any], feed_name: str) -> List[str]:
@@ -1167,6 +1314,18 @@ def apply_query_filters(
 ) -> Tuple[pd.DataFrame, List[str]]:
     filtered = feeds_df.copy()
     notes: List[str] = []
+
+    for nutrient, rule in query_constraints.get("nutrient_constraints", {}).items():
+        if nutrient not in filtered.columns:
+            notes.append(f"El nutriente {nutrient_label(nutrient)} se pidió en la consulta, pero no está disponible en el Excel.")
+            continue
+        previous = len(filtered)
+        mask = filtered[nutrient].apply(lambda value: value_satisfies_rule(value, rule))
+        filtered = filtered[mask]
+        notes.append(
+            f"Filtro por {nutrient_label(nutrient)} aplicado ({describe_rule(rule)}). "
+            f"Se mantienen {len(filtered)} de {previous} piensos."
+        )
 
     price_max = query_constraints.get("price_max")
     if price_max is not None and "price" in filtered.columns:
@@ -1188,8 +1347,46 @@ def apply_query_filters(
         filtered = filtered[mask]
         notes.append(f"Filtro de exclusión aplicado: sin '{term}'. Se mantienen {len(filtered)} de {previous} piensos.")
 
-    return filtered, notes
 
+    name_terms = query_constraints.get("name_terms", [])
+    if name_terms:
+        original_scores = feeds_df["feed_name"].apply(lambda name: text_match_ratio(feed_search_blob(details, name), name_terms))
+        current_scores = filtered["feed_name"].apply(lambda name: text_match_ratio(feed_search_blob(details, name), name_terms)) if not filtered.empty else pd.Series(dtype=float)
+
+        exact_mask = current_scores >= 0.999 if not current_scores.empty else pd.Series(dtype=bool)
+        partial_mask = current_scores > 0 if not current_scores.empty else pd.Series(dtype=bool)
+
+        if not exact_mask.empty and exact_mask.any():
+            previous = len(filtered)
+            filtered = filtered[exact_mask]
+            notes.append(
+                "Filtro textual aplicado con coincidencia completa en nombre/fórmula: "
+                + ", ".join(name_terms)
+                + f". Se mantienen {len(filtered)} de {previous} piensos."
+            )
+        elif not partial_mask.empty and partial_mask.any():
+            previous = len(filtered)
+            filtered = filtered[partial_mask]
+            notes.append(
+                "Filtro textual aplicado con coincidencia parcial en nombre/fórmula: "
+                + ", ".join(name_terms)
+                + f". Se mantienen {len(filtered)} de {previous} piensos."
+            )
+        elif (original_scores > 0).any():
+            notes.append(
+                "Sí existen productos relacionados con "
+                + ", ".join(name_terms)
+                + " en el Excel, pero ninguno cumple además los filtros nutricionales y/o de precio indicados."
+            )
+            filtered = filtered.iloc[0:0]
+        else:
+            notes.append(
+                "La consulta incluye términos textuales ("
+                + ", ".join(name_terms)
+                + "), pero no hay coincidencias directas en el nombre o la fórmula del Excel."
+            )
+
+    return filtered, notes
 
 
 def score_rule(value: Any, rule: Dict[str, Any]) -> float:
@@ -1235,8 +1432,11 @@ def describe_rule(rule: Dict[str, Any]) -> str:
         return f"≈ {rule['value']:.3f}"
     if kind == "range":
         return f"{rule['min']:.3f} – {rule['max']:.3f}"
+    if kind == "preference_max":
+        return "priorizar valor alto"
+    if kind == "preference_min":
+        return "priorizar valor bajo"
     return "n/d"
-
 
 
 def rank_feeds(
@@ -1245,49 +1445,110 @@ def rank_feeds(
     selected_nutrients: List[str],
     top_n: int,
     prefer_low_price: bool,
+    details: Optional[Dict[str, Any]] = None,
+    query_constraints: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any], List[str]]:
     ranking_rows: List[Dict[str, Any]] = []
     score_details: Dict[str, Any] = {}
     notes: List[str] = []
 
-    nutrients_in_scope = list(requirements.keys())
-    if not nutrients_in_scope:
-        nutrients_in_scope = [n for n in selected_nutrients if n in feeds_df.columns]
-        for nutrient in nutrients_in_scope:
-            series = pd.to_numeric(feeds_df[nutrient], errors="coerce")
-            target = series.median(skipna=True)
-            if pd.notna(target):
-                requirements[nutrient] = {
-                    "kind": "target",
-                    "value": float(target),
-                    "tol": max(abs(float(target)) * 0.12, 0.1),
-                    "weight": 1.0,
-                }
-        if nutrients_in_scope:
-            notes.append("No había un perfil FEDNA directamente utilizable para todos los nutrientes elegidos; se ha usado como referencia el centro de la distribución del Excel para los nutrientes seleccionados.")
+    working_requirements = {nutrient: rule.copy() for nutrient, rule in requirements.items()}
+    query_constraints = query_constraints or {}
+    details = details or {}
+    name_terms = query_constraints.get("name_terms", [])
 
-    if not requirements:
-        raise ValueError("No se pudo construir una base de ranking con los nutrientes seleccionados y los datos disponibles.")
+    if feeds_df.empty:
+        raise ValueError("No hay piensos para ordenar después de aplicar los filtros.")
 
+    if not working_requirements and not name_terms and not prefer_low_price:
+        if selected_nutrients:
+            for nutrient in selected_nutrients:
+                if nutrient in feeds_df.columns:
+                    working_requirements[nutrient] = {
+                        "kind": default_preference_kind(nutrient),
+                        "weight": 1.0,
+                        "fallback": True,
+                    }
+            if working_requirements:
+                notes.append(
+                    "No se detectaron restricciones numéricas en el chat; se usa un ranking exploratorio del Excel basado en los nutrientes seleccionados."
+                )
+        if not working_requirements and "price" in feeds_df.columns:
+            prefer_low_price = True
+            notes.append("No había restricciones técnicas utilizables; se ordena el Excel por precio ascendente como criterio exploratorio.")
+
+    if not working_requirements and not name_terms and not prefer_low_price:
+        raise ValueError("No se pudo construir un criterio de búsqueda útil a partir del chat y del Excel disponible.")
+
+    pref_score_maps: Dict[str, Dict[Any, float]] = {}
+    for nutrient, rule in working_requirements.items():
+        if rule.get("kind") not in {"preference_max", "preference_min"}:
+            continue
+        if nutrient not in feeds_df.columns:
+            continue
+        series = pd.to_numeric(feeds_df[nutrient], errors="coerce")
+        valid = series.dropna()
+        if valid.empty:
+            pref_score_maps[nutrient] = {}
+            continue
+        min_val = float(valid.min())
+        max_val = float(valid.max())
+        nutrient_scores: Dict[Any, float] = {}
+        for row_idx, value in series.items():
+            numeric_value = safe_float(value)
+            if numeric_value is None:
+                nutrient_scores[row_idx] = 0.0
+                continue
+            if max_val <= min_val:
+                nutrient_scores[row_idx] = 1.0
+                continue
+            if rule.get("kind") == "preference_max":
+                nutrient_scores[row_idx] = max(0.0, min(1.0, (numeric_value - min_val) / (max_val - min_val)))
+            else:
+                nutrient_scores[row_idx] = max(0.0, min(1.0, (max_val - numeric_value) / (max_val - min_val)))
+        pref_score_maps[nutrient] = nutrient_scores
+
+    price_scores: Dict[Any, float] = {}
     price_series = pd.to_numeric(feeds_df.get("price"), errors="coerce") if "price" in feeds_df.columns else pd.Series(dtype=float)
-    min_price = price_series.min(skipna=True) if not price_series.empty else np.nan
-    max_price = price_series.max(skipna=True) if not price_series.empty else np.nan
+    if prefer_low_price and not price_series.empty:
+        valid_price = price_series.dropna()
+        if not valid_price.empty:
+            min_price = float(valid_price.min())
+            max_price = float(valid_price.max())
+            for row_idx, value in price_series.items():
+                numeric_value = safe_float(value)
+                if numeric_value is None:
+                    price_scores[row_idx] = 0.0
+                    continue
+                if max_price <= min_price:
+                    price_scores[row_idx] = 1.0
+                else:
+                    price_scores[row_idx] = max(0.0, min(1.0, (max_price - numeric_value) / (max_price - min_price)))
 
-    for _, row in feeds_df.iterrows():
+    text_scores: Dict[Any, float] = {}
+    if name_terms:
+        for row_idx, row in feeds_df.iterrows():
+            text_scores[row_idx] = text_match_ratio(feed_search_blob(details, row.get("feed_name")), name_terms)
+
+    for row_idx, row in feeds_df.iterrows():
         total_weight = 0.0
         total_score = 0.0
         nutrient_breakdown: List[Dict[str, Any]] = []
-        hard_failures = 0
 
-        for nutrient, rule in requirements.items():
+        for nutrient, rule in working_requirements.items():
             if nutrient not in feeds_df.columns:
                 continue
             weight = float(rule.get("weight", 1.0))
-            score = score_rule(row.get(nutrient), rule)
+            kind = rule.get("kind")
+            if kind in {"min", "max", "target", "range"}:
+                score = score_rule(row.get(nutrient), rule)
+            elif kind in {"preference_max", "preference_min"}:
+                score = pref_score_maps.get(nutrient, {}).get(row_idx, 0.0)
+            else:
+                score = 0.0
+
             total_weight += weight
             total_score += score * weight
-            if score < 0.5:
-                hard_failures += 1
             nutrient_breakdown.append(
                 {
                     "nutrient": nutrient,
@@ -1298,15 +1559,36 @@ def rank_feeds(
                 }
             )
 
-        aptitude = 0.0 if total_weight == 0 else 100.0 * total_score / total_weight
-        if hard_failures >= max(2, math.ceil(len(requirements) * 0.4)):
-            aptitude *= 0.85
+        if name_terms:
+            text_score = text_scores.get(row_idx, 0.0)
+            total_weight += 1.2
+            total_score += text_score * 1.2
+            nutrient_breakdown.append(
+                {
+                    "nutrient": "__TEXT__",
+                    "label": "Coincidencia textual",
+                    "value": ", ".join(term for term in name_terms if term in feed_search_blob(details, row.get("feed_name"))),
+                    "requirement": "coincidir con el chat",
+                    "score": round(text_score * 100, 1),
+                }
+            )
 
-        price_bonus = 0.0
+        if prefer_low_price and price_scores:
+            p_score = price_scores.get(row_idx, 0.0)
+            total_weight += 0.9
+            total_score += p_score * 0.9
+            nutrient_breakdown.append(
+                {
+                    "nutrient": "__PRICE__",
+                    "label": "Precio",
+                    "value": row.get("price"),
+                    "requirement": "priorizar precio bajo",
+                    "score": round(p_score * 100, 1),
+                }
+            )
+
+        aptitude = 0.0 if total_weight == 0 else 100.0 * total_score / total_weight
         price_value = safe_float(row.get("price"))
-        if prefer_low_price and price_value is not None and pd.notna(min_price) and pd.notna(max_price) and max_price > min_price:
-            price_bonus = 8.0 * (1.0 - ((price_value - min_price) / (max_price - min_price)))
-            aptitude += price_bonus
 
         ranking_row = {
             "Pienso": row.get("feed_name"),
@@ -1319,7 +1601,6 @@ def rank_feeds(
         ranking_rows.append(ranking_row)
         score_details[row.get("feed_name")] = {
             "nutrient_breakdown": nutrient_breakdown,
-            "price_bonus": round(price_bonus, 2),
             "aptitude": round(float(aptitude), 2),
         }
 
@@ -1334,7 +1615,6 @@ def rank_feeds(
         ascending.append(True)
     ranking_df = ranking_df.sort_values(sort_cols, ascending=ascending).head(top_n).reset_index(drop=True)
     return ranking_df, score_details, notes
-
 
 
 def create_comparison_table(
@@ -1397,38 +1677,48 @@ def generate_assistant_answer(
     selected_nutrients: List[str],
 ) -> str:
     lines: List[str] = []
-    lines.append(f"Perfil FEDNA activo: **{profile.get('name', 'General')}**.")
-    if profile.get("source_note"):
-        lines.append(profile["source_note"])
+    lines.append("La búsqueda y el ranking se han hecho **solo con el Excel cargado**.")
+    lines.append("FEDNA se usa aquí únicamente como contexto técnico para el chat, no como motor de ordenación de productos.")
     if selected_nutrients:
-        lines.append("El ranking se ha calculado con estos nutrientes en foco: " + ", ".join(nutrient_label(n) for n in selected_nutrients) + ".")
+        lines.append(
+            "Nutrientes visibles / considerados en esta ejecución: "
+            + ", ".join(nutrient_label(n) for n in selected_nutrients)
+            + "."
+        )
     if applied_filters:
+        lines.append("**Filtros aplicados sobre el Excel:**")
         lines.extend(f"- {note}" for note in applied_filters)
     if ranking_notes:
         lines.extend(f"- {note}" for note in ranking_notes)
 
     if ranking_df.empty:
-        lines.append("No se han encontrado piensos tras aplicar los filtros actuales.")
+        lines.append("No se han encontrado piensos que cumplan los criterios activos del chat.")
+        if fedna_snippets:
+            lines.append("")
+            lines.append("**Contexto FEDNA para la categoría seleccionada:**")
+            for snippet in fedna_snippets[:2]:
+                excerpt = truncate_text(snippet["text"], max_len=280)
+                lines.append(f"- {snippet['file_name']} · p. {snippet['page']}: {excerpt}")
         return "\n".join(lines)
 
     top_rows = ranking_df.head(min(3, len(ranking_df)))
-    lines.append("**Top recomendaciones:**")
+    lines.append("**Top recomendaciones del Excel:**")
     for idx, row in top_rows.iterrows():
         reason = summarise_feed_reason(row["Pienso"], score_details)
         price_text = "n/d" if pd.isna(row.get("Precio")) else f"{row['Precio']:.3f}"
         lines.append(f"{idx + 1}. **{row['Pienso']}** — aptitud {row['Aptitud']:.2f} / 100; precio {price_text}. {reason}")
 
-    if fedna_snippets:
-        lines.append("**Fragmentos FEDNA recuperados para contextualizar la consulta:**")
-        for snippet in fedna_snippets[:3]:
-            excerpt = truncate_text(snippet["text"], max_len=320)
-            lines.append(f"- {snippet['file_name']} · p. {snippet['page']}: {excerpt}")
-
     if query.strip():
         lines.append(f"Consulta interpretada: _{query.strip()}_.")
 
-    return "\n".join(lines)
+    if fedna_snippets:
+        lines.append("")
+        lines.append("**Contexto FEDNA relacionado con la categoría seleccionada (solo informativo):**")
+        for snippet in fedna_snippets[:3]:
+            excerpt = truncate_text(snippet["text"], max_len=280)
+            lines.append(f"- {snippet['file_name']} · p. {snippet['page']}: {excerpt}")
 
+    return "\n".join(lines)
 
 
 def generate_summary_report(
@@ -1445,15 +1735,16 @@ def generate_summary_report(
     lines.append("# Informe resumen")
     lines.append("")
     lines.append(f"**Especie/categoría:** {species}")
-    lines.append(f"**Consulta:** {query or 'Ranking base con el perfil por defecto'}")
-    lines.append(f"**Perfil FEDNA activo:** {profile.get('name', 'General')}")
+    lines.append(f"**Consulta:** {query or 'Ranking exploratorio basado en el Excel'}")
+    lines.append("**Uso de FEDNA:** contexto técnico para el chat; no interviene en el ranking de productos.")
+    lines.append(f"**Perfil FEDNA contextual:** {profile.get('name', 'General')}")
     lines.append(f"**Formato detectado del Excel:** {source_format}")
     if selected_nutrients:
-        lines.append("**Nutrientes utilizados en el ranking:** " + ", ".join(nutrient_label(n) for n in selected_nutrients))
+        lines.append("**Nutrientes mostrados / considerados:** " + ", ".join(nutrient_label(n) for n in selected_nutrients))
     lines.append("")
     lines.append("## Resultados")
     if ranking_df.empty:
-        lines.append("No se obtuvieron resultados con los filtros actuales.")
+        lines.append("No se obtuvieron resultados que cumplieran los filtros del chat.")
     else:
         for idx, row in ranking_df.iterrows():
             lines.append(f"{idx + 1}. {row['Pienso']} — aptitud {row['Aptitud']:.2f} / 100; precio {row['Precio'] if pd.notna(row['Precio']) else 'n/d'}.")
@@ -1463,21 +1754,20 @@ def generate_summary_report(
     if not ranking_df.empty:
         best = ranking_df.iloc[0]
         lines.append(
-            f"El pienso recomendado es **{best['Pienso']}** porque alcanza la mayor aptitud global con el perfil seleccionado. "
-            f"La decisión está basada en el ajuste nutricional frente al perfil FEDNA activo y, cuando procede, en el coste como criterio de desempate."
+            f"El pienso recomendado es **{best['Pienso']}** porque es el que mejor encaja con los filtros y prioridades leídos desde el chat "
+            f"y contrastados exclusivamente contra el Excel cargado."
         )
     else:
-        lines.append("No es posible recomendar un pienso con la información y los filtros actuales.")
+        lines.append("No es posible recomendar un pienso con la consulta actual. Conviene revisar si el Excel contiene productos compatibles con lo pedido.")
     lines.append("")
     lines.append("## Supuestos y limitaciones")
-    lines.append("- El ranking usa un perfil FEDNA representativo por categoría; no sustituye el ajuste fino por fase, edad, genética, estado sanitario o manejo.")
-    lines.append("- Si el Excel no contiene todos los nutrientes del perfil, el algoritmo trabaja con la intersección disponible.")
-    lines.append("- Las fórmulas de aptitud son deterministas y explicables; no usan un LLM externo.")
+    lines.append("- Los productos se ordenan con datos del Excel y con reglas deterministas; no se usa un LLM externo para calcular la aptitud.")
+    lines.append("- FEDNA se muestra como soporte técnico contextual y no modifica el ranking.")
+    lines.append("- Si el chat pide un nutriente o criterio que no existe en el Excel, el sistema lo indica y sigue trabajando con lo disponible.")
     if warnings:
         for warning in warnings:
             lines.append(f"- {warning}")
     return "\n".join(lines)
-
 
 
 def default_selected_nutrients(species: str, available_nutrients: List[str], limit: int) -> List[str]:
@@ -1575,43 +1865,42 @@ def render_manual_status(manual_entries: List[Dict[str, Any]], species: str) -> 
 def get_query_suggestions(species: str, selected_nutrients: List[str]) -> List[str]:
     highlighted = ", ".join(nutrient_label(code) for code in selected_nutrients[:3])
     if not highlighted:
-        highlighted = "energía, proteína y aminoácidos clave"
+        highlighted = "los nutrientes seleccionados"
 
     species_specific = {
         "Porcino": [
-            "Quiero el top 5 para porcino de crecimiento-cebo, priorizando lisina, energía neta y proteína bruta, con el menor precio posible.",
-            "Busca un pienso de porcino con lisina >= 1.00, calcio entre 0.65 y 0.85 y que evite trigo si aparece en la fórmula.",
-            "Dame una recomendación para cerdas en gestación, explicando qué pienso se ajusta mejor y por qué.",
+            "Busca piensos de gestantes con lisina >= 0.70 y precio <= 290.",
+            "Quiero los mejores piensos de crecimiento con proteína alta, energía alta y el menor precio posible.",
+            "Filtra fórmulas de acabado que cumplan calcio entre 0.60 y 0.80 y fósforo >= 0.45.",
         ],
         "Avicultura": [
-            "Quiero el top 3 para pollos de carne, priorizando EMAn, lisina y metionina+cistina, y explica el criterio usado.",
-            "Busca una opción avícola con calcio dentro de rango y proteína suficiente, priorizando la alternativa más económica.",
-            "Compara los mejores piensos avícolas con foco en energía, lisina y treonina, y resume cuál elegirías.",
+            "Quiero piensos con EMAn alta, lisina alta y precio bajo.",
+            "Busca fórmulas que cumplan calcio entre 0.80 y 0.95 y metionina >= 0.45.",
+            "Muéstrame los productos que mejor encajan con proteína alta y fibra baja.",
         ],
         "Rumiantes de carne": [
-            "Quiero el top 5 para terneros de cebo, priorizando proteína bruta, FND y energía, con explicación breve de aptitud.",
-            "Busca un pienso para corderos de cebo con FND en rango y almidón moderado, y dime cuál encaja mejor.",
-            "Compara las mejores fórmulas para rumiantes de carne dando peso a proteína, FND y calcio.",
+            "Busca fórmulas con proteína alta, FND moderada y precio bajo.",
+            "Quiero productos que cumplan calcio entre 0.70 y 1.10 y energía alta.",
+            "Filtra piensos con almidón alto y proteína suficiente.",
         ],
         "Rumiantes de leche": [
-            "Busca el mejor pienso para lactación intensiva, priorizando proteína bruta, FND y UFL/UFC, y resume la recomendación final.",
-            "Quiero una opción para vacas secas o preparto con calcio y fósforo dentro de rango y fibra suficiente.",
-            "Dame el top 4 para rumiantes de leche priorizando fibra, proteína y equilibrio mineral.",
+            "Busca piensos con proteína alta, FND suficiente y buen ajuste mineral.",
+            "Quiero fórmulas con calcio entre 0.80 y 1.10 y fósforo >= 0.40.",
+            "Muéstrame las opciones más económicas sin perder proteína.",
         ],
         "Reposición de rumiantes": [
-            "Quiero el top 5 para recría, priorizando proteína bruta, energía y calcio, con un resumen claro del mejor pienso.",
-            "Busca una fórmula de reposición con proteína suficiente y fibra moderada, evitando exceso de grasa.",
-            "Compara los mejores piensos de recría usando como criterio principal energía, proteína y fósforo.",
+            "Busca fórmulas de recría con proteína alta y calcio suficiente.",
+            "Quiero piensos con energía alta y precio bajo.",
+            "Filtra productos con fósforo >= 0.40 y fibra moderada.",
         ],
     }
 
     generic = [
-        f"Dame una recomendación para {species.lower()} usando sobre todo {highlighted}.",
-        "Quiero una alternativa barata pero técnicamente correcta, con una explicación de los compromisos nutricionales.",
-        "Muéstrame el ranking y después explica en detalle el mejor pienso seleccionado.",
+        f"Ordena el Excel usando sobre todo {highlighted}.",
+        "Busca un producto barato que además cumpla mis límites de nutrientes.",
+        "Filtra por el nombre del producto o por ingredientes y luego ordénalo por aptitud.",
     ]
     return species_specific.get(species, []) + generic
-
 
 
 def reset_search_state(clear_query: bool = True) -> None:
@@ -1660,14 +1949,22 @@ def run_recommendation(
     filtered_df, applied_filters = apply_query_filters(feeds_df, details, query_constraints)
     requirements = merge_requirements(profile, query_constraints, selected_nutrients, available_nutrients)
 
-    ranking_df, score_details, ranking_notes = rank_feeds(
-        filtered_df,
-        requirements=requirements,
-        selected_nutrients=selected_nutrients,
-        top_n=top_n,
-        prefer_low_price=query_constraints.get("prefer_low_price", False),
-    )
-    fedna_snippets = retrieve_fedna_snippets(manual_entries, species, query, top_k=3)
+
+    fedna_snippets = retrieve_fedna_snippets(manual_entries, species, query or species, top_k=3)
+    if filtered_df.empty:
+        ranking_df = pd.DataFrame(columns=["Pienso", "Precio", "Aptitud"])
+        score_details = {}
+        ranking_notes = ["No quedan productos tras aplicar los filtros leídos desde el chat sobre el Excel."]
+    else:
+        ranking_df, score_details, ranking_notes = rank_feeds(
+            filtered_df,
+            requirements=requirements,
+            selected_nutrients=selected_nutrients,
+            top_n=top_n,
+            prefer_low_price=query_constraints.get("prefer_low_price", False),
+            details=details,
+            query_constraints=query_constraints,
+        )
     assistant_answer = generate_assistant_answer(
         species=species,
         query=query,
@@ -1701,7 +1998,6 @@ def run_recommendation(
     }
 
 
-
 def init_session_state() -> None:
     st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("last_result", None)
@@ -1719,7 +2015,7 @@ def main() -> None:
 
     st.title("FEDNA Feed Recommender")
     st.caption(
-        "Aplicación Streamlit para relacionar manuales FEDNA con formulaciones de pienso y ordenar los piensos por aptitud nutricional."
+        "Aplicación Streamlit para buscar y ordenar piensos a partir del Excel cargado. FEDNA se usa como contexto técnico en el chat, no para decidir el ranking."
     )
 
     with st.sidebar:
@@ -1746,7 +2042,7 @@ def main() -> None:
             "Carga un Excel para empezar. La app soporta tanto un formato tabular clásico (una fila por pienso) como reportes de formulación tipo Multi-Mix con bloques de Specification / Included Raw Materials / Analysis."
         )
         st.markdown(
-            "**Sugerencia de uso:** selecciona la categoría, sube el Excel, define los nutrientes a considerar y utiliza la consulta editable para lanzar búsquedas como `quiero un pienso de crecimiento con lisina > 1.0 y precio < 320`."
+            "**Sugerencia de uso:** selecciona la categoría, sube el Excel, define los nutrientes a mostrar y utiliza la consulta editable para buscar sobre el propio Excel, por ejemplo: `busca gestantes con lisina > 0.70 y precio < 290`."
         )
         return
 
@@ -1791,7 +2087,7 @@ def main() -> None:
 
     st.subheader("Consulta y chat")
     st.caption(
-        "El cuadro de consulta es editable y permanece visible. Puedes cargar una propuesta, modificarla, refrescar la búsqueda actual o limpiar el estado para empezar otra nueva."
+        "La consulta es editable y visible. La app interpreta el chat para filtrar y ordenar el Excel; FEDNA solo se usa para añadir contexto técnico en la respuesta."
     )
 
     suggestions = get_query_suggestions(species, selected_nutrients)
@@ -1828,7 +2124,7 @@ def main() -> None:
         use_container_width=True,
         disabled=not bool(st.session_state.get("query_draft", "").strip() or st.session_state.get("last_query", "").strip()),
     )
-    run_base = action_col3.button("Ranking base FEDNA", use_container_width=True)
+    run_base = action_col3.button("Ranking base Excel", use_container_width=True)
     new_search = action_col4.button("Nueva búsqueda", use_container_width=True)
 
     if new_search:
@@ -1853,7 +2149,7 @@ def main() -> None:
             )
             st.session_state["last_result"] = result
             st.session_state["last_query"] = ""
-            base_message = "Ranking base ejecutado con el perfil FEDNA por defecto de la categoría seleccionada."
+            base_message = "Ranking exploratorio ejecutado sobre el Excel cargado."
             st.session_state["chat_history"].append({"role": "assistant", "content": base_message + "\n\n" + result["assistant_answer"]})
         except Exception as exc:
             st.error(f"No se pudo ejecutar el ranking base: {exc}")
