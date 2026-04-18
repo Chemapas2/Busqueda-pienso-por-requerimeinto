@@ -1624,6 +1624,25 @@ def reset_search_state(clear_query: bool = True) -> None:
 
 
 
+def queue_new_search() -> None:
+    st.session_state["pending_new_search"] = True
+
+
+
+def queue_query_prefill(query: str) -> None:
+    st.session_state["pending_query_prefill"] = query
+
+
+
+def apply_pending_state_actions() -> None:
+    if st.session_state.pop("pending_new_search", False):
+        reset_search_state(clear_query=True)
+    pending_prefill = st.session_state.pop("pending_query_prefill", None)
+    if pending_prefill is not None:
+        st.session_state["query_draft"] = pending_prefill
+
+
+
 def run_recommendation(
     species: str,
     query: str,
@@ -1689,11 +1708,14 @@ def init_session_state() -> None:
     st.session_state.setdefault("query_draft", "")
     st.session_state.setdefault("last_query", "")
     st.session_state.setdefault("selected_feed_name", None)
+    st.session_state.setdefault("pending_new_search", False)
+    st.session_state.setdefault("pending_query_prefill", None)
 
 
 
 def main() -> None:
     init_session_state()
+    apply_pending_state_actions()
 
     st.title("FEDNA Feed Recommender")
     st.caption(
@@ -1784,7 +1806,7 @@ def main() -> None:
         )
         proposal_col, helper_col = st.columns([1, 2])
         if proposal_col.button("Usar propuesta", use_container_width=True):
-            st.session_state["query_draft"] = chosen_template or ""
+            queue_query_prefill(chosen_template or "")
             st.rerun()
         helper_col.info("Estas propuestas sirven como punto de partida. El texto final siempre se edita en el cuadro inferior.")
 
@@ -1810,13 +1832,14 @@ def main() -> None:
     new_search = action_col4.button("Nueva búsqueda", use_container_width=True)
 
     if new_search:
-        reset_search_state(clear_query=True)
+        queue_new_search()
         st.rerun()
 
     active_query = st.session_state.get("query_draft", "").strip()
     if refresh_query and not active_query:
         active_query = st.session_state.get("last_query", "").strip()
-        st.session_state["query_draft"] = active_query
+        if active_query:
+            queue_query_prefill(active_query)
 
     if run_base:
         try:
