@@ -12,7 +12,7 @@ Aplicación web en Streamlit para relacionar perfiles nutricionales FEDNA con fo
   - Porcino
 - Carga un Excel mensual de formulación.
 - Normaliza nutrientes y columnas.
-- Responde preguntas en lenguaje natural desde un chat.
+- Responde preguntas en lenguaje natural desde un chat con cuadro de consulta visible, editable y con propuestas rápidas reutilizables.
 - Calcula un ranking de aptitud nutricional y devuelve el Top N.
 - Permite limitar el ranking a los nutrientes seleccionados por el usuario.
 - Muestra detalle de cada pienso:
@@ -163,7 +163,7 @@ Los nombres de archivo deberían contener pistas como:
 
 ### Opción B. Subida desde la interfaz
 
-En la barra lateral hay un uploader opcional para cargar uno o varios PDF FEDNA.
+En la barra lateral hay un uploader opcional para cargar uno o varios PDF FEDNA. Si alguno falla o no tiene texto extraíble, la aplicación lo marcará como incidencia pero no detendrá el flujo principal.
 
 ## Cómo usa FEDNA la app
 
@@ -175,6 +175,14 @@ La app trabaja con dos capas:
 Esto permite tener una app explicable y robusta sin depender de una API externa.
 
 ## Uso del chat
+
+La interfaz incluye:
+
+- un selector de propuestas editables de consulta
+- un cuadro de texto siempre visible para escribir o modificar la pregunta
+- botón **Buscar y rankear**
+- botón **Refrescar resultados** para repetir la búsqueda actual
+- botón **Nueva búsqueda** para limpiar historial y resultados
 
 Ejemplos de preguntas válidas:
 
@@ -216,7 +224,7 @@ El código contempla errores típicos:
 - columnas vacías
 - valores nulos
 - nutrientes no presentes en el Excel
-- PDFs FEDNA no disponibles
+- PDFs FEDNA no disponibles o con texto no extraíble, sin bloquear la app
 - filtros que dejan el conjunto de resultados vacío
 
 ## Limitaciones

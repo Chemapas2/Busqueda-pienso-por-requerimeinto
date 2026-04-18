@@ -534,7 +534,14 @@ MULTIMIX_SPEC_RE = re.compile(
 
 @st.cache_data(show_spinner=False)
 def extract_pdf_pages(file_name: str, file_bytes: bytes) -> List[Dict[str, Any]]:
-    reader = PdfReader(io.BytesIO(file_bytes))
+    if not file_bytes:
+        return []
+
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+    except Exception:
+        return []
+
     pages: List[Dict[str, Any]] = []
     for idx, page in enumerate(reader.pages, start=1):
         try:
@@ -912,8 +919,38 @@ def build_manual_entries(uploaded_manuals: List[Any]) -> List[Dict[str, Any]]:
     enriched_entries = []
     for entry in entries:
         assigned_species = infer_species_from_manual_name(entry["file_name"])
-        pages = extract_pdf_pages(entry["file_name"], entry["file_bytes"])
-        enriched_entries.append({**entry, "species": assigned_species, "pages": pages})
+        try:
+            pages = extract_pdf_pages(entry["file_name"], entry["file_bytes"])
+            if pages:
+                enriched_entries.append(
+                    {
+                        **entry,
+                        "species": assigned_species,
+                        "pages": pages,
+                        "load_status": "ok",
+                        "load_error": None,
+                    }
+                )
+            else:
+                enriched_entries.append(
+                    {
+                        **entry,
+                        "species": assigned_species,
+                        "pages": [],
+                        "load_status": "empty",
+                        "load_error": "No se pudo extraer texto útil del PDF.",
+                    }
+                )
+        except Exception as exc:
+            enriched_entries.append(
+                {
+                    **entry,
+                    "species": assigned_species,
+                    "pages": [],
+                    "load_status": "error",
+                    "load_error": str(exc),
+                }
+            )
     return enriched_entries
 
 
@@ -1509,17 +1546,75 @@ def render_feed_detail(
 
 
 def render_manual_status(manual_entries: List[Dict[str, Any]], species: str) -> None:
-    relevant = [m for m in manual_entries if m.get("species") == species]
+    relevant = [m for m in manual_entries if m.get("species") == species and m.get("load_status") == "ok"]
     if relevant:
         st.success(
-            "Manuales FEDNA cargados para esta categoría: "
+            "Manuales FEDNA listos para esta categoría: "
             + ", ".join(f"{m['file_name']} ({m['origin']})" for m in relevant)
         )
     else:
-        st.warning(
-            "No se ha encontrado un PDF FEDNA para esta categoría. La app seguirá funcionando con perfiles FEDNA integrados, "
+        st.info(
+            "No hay un PDF FEDNA utilizable para esta categoría. La app seguirá funcionando con perfiles FEDNA integrados, "
             "pero sin recuperación de fragmentos del manual."
         )
+
+    failed = [m for m in manual_entries if m.get("load_status") in {"empty", "error"}]
+    if failed:
+        with st.expander("Ver incidencias de carga de PDF"):
+            for item in failed:
+                st.warning(f"{item['file_name']}: {item.get('load_error') or 'No se pudo procesar el archivo.'}")
+
+
+
+def get_query_suggestions(species: str, selected_nutrients: List[str]) -> List[str]:
+    highlighted = ", ".join(nutrient_label(code) for code in selected_nutrients[:3])
+    if not highlighted:
+        highlighted = "energía, proteína y aminoácidos clave"
+
+    species_specific = {
+        "Porcino": [
+            "Quiero el top 5 para porcino de crecimiento-cebo, priorizando lisina, energía neta y proteína bruta, con el menor precio posible.",
+            "Busca un pienso de porcino con lisina >= 1.00, calcio entre 0.65 y 0.85 y que evite trigo si aparece en la fórmula.",
+            "Dame una recomendación para cerdas en gestación, explicando qué pienso se ajusta mejor y por qué.",
+        ],
+        "Avicultura": [
+            "Quiero el top 3 para pollos de carne, priorizando EMAn, lisina y metionina+cistina, y explica el criterio usado.",
+            "Busca una opción avícola con calcio dentro de rango y proteína suficiente, priorizando la alternativa más económica.",
+            "Compara los mejores piensos avícolas con foco en energía, lisina y treonina, y resume cuál elegirías.",
+        ],
+        "Rumiantes de carne": [
+            "Quiero el top 5 para terneros de cebo, priorizando proteína bruta, FND y energía, con explicación breve de aptitud.",
+            "Busca un pienso para corderos de cebo con FND en rango y almidón moderado, y dime cuál encaja mejor.",
+            "Compara las mejores fórmulas para rumiantes de carne dando peso a proteína, FND y calcio.",
+        ],
+        "Rumiantes de leche": [
+            "Busca el mejor pienso para lactación intensiva, priorizando proteína bruta, FND y UFL/UFC, y resume la recomendación final.",
+            "Quiero una opción para vacas secas o preparto con calcio y fósforo dentro de rango y fibra suficiente.",
+            "Dame el top 4 para rumiantes de leche priorizando fibra, proteína y equilibrio mineral.",
+        ],
+        "Reposición de rumiantes": [
+            "Quiero el top 5 para recría, priorizando proteína bruta, energía y calcio, con un resumen claro del mejor pienso.",
+            "Busca una fórmula de reposición con proteína suficiente y fibra moderada, evitando exceso de grasa.",
+            "Compara los mejores piensos de recría usando como criterio principal energía, proteína y fósforo.",
+        ],
+    }
+
+    generic = [
+        f"Dame una recomendación para {species.lower()} usando sobre todo {highlighted}.",
+        "Quiero una alternativa barata pero técnicamente correcta, con una explicación de los compromisos nutricionales.",
+        "Muéstrame el ranking y después explica en detalle el mejor pienso seleccionado.",
+    ]
+    return species_specific.get(species, []) + generic
+
+
+
+def reset_search_state(clear_query: bool = True) -> None:
+    st.session_state["chat_history"] = []
+    st.session_state["last_result"] = None
+    st.session_state["last_query"] = ""
+    st.session_state["selected_feed_name"] = None
+    if clear_query:
+        st.session_state["query_draft"] = ""
 
 
 
@@ -1585,6 +1680,9 @@ def run_recommendation(
 def init_session_state() -> None:
     st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("last_result", None)
+    st.session_state.setdefault("query_draft", "")
+    st.session_state.setdefault("last_query", "")
+    st.session_state.setdefault("selected_feed_name", None)
 
 
 
@@ -1605,10 +1703,14 @@ def main() -> None:
             "PDFs FEDNA (opcional, múltiples)",
             type=["pdf"],
             accept_multiple_files=True,
-            help="Si no se cargan aquí, la app buscará PDFs en ./fedna_manuals/.",
+            help="Si no se cargan aquí, la app buscará PDFs en ./fedna_manuals/. Los PDFs que fallen no bloquearán la app.",
         )
 
-    manual_entries = build_manual_entries(manual_files or [])
+    try:
+        manual_entries = build_manual_entries(manual_files or [])
+    except Exception as exc:
+        st.warning(f"No se pudieron procesar los PDF FEDNA: {exc}")
+        manual_entries = []
     render_manual_status(manual_entries, species)
 
     if excel_file is None:
@@ -1616,7 +1718,7 @@ def main() -> None:
             "Carga un Excel para empezar. La app soporta tanto un formato tabular clásico (una fila por pienso) como reportes de formulación tipo Multi-Mix con bloques de Specification / Included Raw Materials / Analysis."
         )
         st.markdown(
-            "**Sugerencia de uso:** selecciona la categoría, sube el Excel, define los nutrientes a considerar y lanza una consulta en el chat como por ejemplo `quiero un pienso de crecimiento con lisina > 1.0 y precio < 320`."
+            "**Sugerencia de uso:** selecciona la categoría, sube el Excel, define los nutrientes a considerar y utiliza la consulta editable para lanzar búsquedas como `quiero un pienso de crecimiento con lisina > 1.0 y precio < 320`."
         )
         return
 
@@ -1659,15 +1761,50 @@ def main() -> None:
         max_selections=int(nutrient_limit),
     )
 
-    st.subheader("Chat")
-    st.caption("Las respuestas se basan en el perfil FEDNA activo, los nutrientes del Excel y, si existen, fragmentos de los manuales PDF cargados.")
+    st.subheader("Consulta y chat")
+    st.caption(
+        "El campo de consulta queda siempre visible. Puedes cargar una propuesta, editarla y lanzar una nueva búsqueda o refrescar la actual."
+    )
 
-    for message in st.session_state["chat_history"]:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    suggestions = get_query_suggestions(species, selected_nutrients)
+    with st.expander("Propuestas editables de consulta", expanded=True):
+        chosen_template = st.selectbox(
+            "Propuesta rápida",
+            options=suggestions,
+            index=0 if suggestions else None,
+            help="Selecciona una propuesta y pulsa 'Cargar propuesta' para llevarla al cuadro editable.",
+        )
+        proposal_col, current_col = st.columns([1, 3])
+        if proposal_col.button("Cargar propuesta", use_container_width=True):
+            st.session_state["query_draft"] = chosen_template or ""
+            st.rerun()
+        current_col.caption("Puedes modificar libremente el texto antes de buscar.")
 
-    run_base = st.button("Ejecutar ranking base con el perfil FEDNA por defecto", use_container_width=True)
-    user_query = st.chat_input("Ej.: Quiero un pienso de crecimiento, lisina > 1.0, proteína entre 16 y 18 y que no lleve trigo")
+    st.text_area(
+        "Consulta editable",
+        key="query_draft",
+        height=150,
+        placeholder="Escribe aquí la consulta. Ejemplo: Quiero el top 5 para porcino, priorizando lisina y energía, con el menor precio posible y sin trigo.",
+    )
+
+    action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+    run_query = action_col1.button("Buscar y rankear", type="primary", use_container_width=True)
+    refresh_query = action_col2.button(
+        "Refrescar resultados",
+        use_container_width=True,
+        disabled=not bool(st.session_state.get("query_draft", "").strip() or st.session_state.get("last_query", "").strip()),
+    )
+    run_base = action_col3.button("Ranking base FEDNA", use_container_width=True)
+    new_search = action_col4.button("Nueva búsqueda", use_container_width=True)
+
+    if new_search:
+        reset_search_state(clear_query=True)
+        st.rerun()
+
+    active_query = st.session_state.get("query_draft", "").strip()
+    if refresh_query and not active_query:
+        active_query = st.session_state.get("last_query", "").strip()
+        st.session_state["query_draft"] = active_query
 
     if run_base:
         try:
@@ -1680,35 +1817,39 @@ def main() -> None:
                 top_n=top_n,
             )
             st.session_state["last_result"] = result
+            st.session_state["last_query"] = ""
             base_message = "Ranking base ejecutado con el perfil FEDNA por defecto de la categoría seleccionada."
             st.session_state["chat_history"].append({"role": "assistant", "content": base_message + "\n\n" + result["assistant_answer"]})
-            with st.chat_message("assistant"):
-                st.markdown(base_message + "\n\n" + result["assistant_answer"])
         except Exception as exc:
             st.error(f"No se pudo ejecutar el ranking base: {exc}")
 
-    if user_query:
-        st.session_state["chat_history"].append({"role": "user", "content": user_query})
-        with st.chat_message("user"):
-            st.markdown(user_query)
-        try:
-            result = run_recommendation(
-                species=species,
-                query=user_query,
-                parsed_excel=parsed_excel,
-                manual_entries=manual_entries,
-                selected_nutrients=selected_nutrients,
-                top_n=top_n,
-            )
-            st.session_state["last_result"] = result
-            st.session_state["chat_history"].append({"role": "assistant", "content": result["assistant_answer"]})
-            with st.chat_message("assistant"):
-                st.markdown(result["assistant_answer"])
-        except Exception as exc:
-            error_text = f"No se pudo generar la recomendación: {exc}"
-            st.session_state["chat_history"].append({"role": "assistant", "content": error_text})
-            with st.chat_message("assistant"):
+    if run_query or refresh_query:
+        if not active_query:
+            st.warning("Escribe o carga una consulta editable antes de buscar.")
+        else:
+            st.session_state["chat_history"].append({"role": "user", "content": active_query})
+            try:
+                result = run_recommendation(
+                    species=species,
+                    query=active_query,
+                    parsed_excel=parsed_excel,
+                    manual_entries=manual_entries,
+                    selected_nutrients=selected_nutrients,
+                    top_n=top_n,
+                )
+                st.session_state["last_result"] = result
+                st.session_state["last_query"] = active_query
+                st.session_state["chat_history"].append({"role": "assistant", "content": result["assistant_answer"]})
+            except Exception as exc:
+                error_text = f"No se pudo generar la recomendación: {exc}"
+                st.session_state["chat_history"].append({"role": "assistant", "content": error_text})
                 st.error(error_text)
+
+    if st.session_state["chat_history"]:
+        st.markdown("#### Historial")
+        for message in st.session_state["chat_history"]:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
     last_result = st.session_state.get("last_result")
     if not last_result:
@@ -1723,9 +1864,16 @@ def main() -> None:
 
     st.dataframe(ranking_df, use_container_width=True, hide_index=True)
 
+    ranking_options = ranking_df["Pienso"].tolist()
+    default_feed = st.session_state.get("selected_feed_name")
+    if default_feed not in ranking_options:
+        default_feed = ranking_options[0]
+        st.session_state["selected_feed_name"] = default_feed
     selected_feed_name = st.selectbox(
         "Selecciona un pienso para ver el detalle",
-        options=ranking_df["Pienso"].tolist(),
+        options=ranking_options,
+        index=ranking_options.index(default_feed),
+        key="selected_feed_name",
     )
     render_feed_detail(
         selected_feed_name=selected_feed_name,
