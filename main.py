@@ -1161,6 +1161,19 @@ def parse_query_constraints(query: str, available_nutrients: List[str]) -> Dict[
 
     include_ingredients = extract_ingredient_terms(query_norm, mode="include")
     exclude_ingredients = extract_ingredient_terms(query_norm, mode="exclude")
+    ingredient_limit_filters: List[Dict[str, str]] = []
+    for pattern, mode in [
+        (r"limites?\s+minimos?\s+de\s+([a-z0-9_\- ]+)", "min"),
+        (r"limites?\s+maximos?\s+de\s+([a-z0-9_\- ]+)", "max"),
+        (r"minimo\s+de\s+([a-z0-9_\- ]+)\s+en\s+la\s+formula", "min"),
+        (r"maximo\s+de\s+([a-z0-9_\- ]+)\s+en\s+la\s+formula", "max"),
+    ]:
+        for match in re.finditer(pattern, query_norm):
+            term = match.group(1).strip()
+            term = re.split(r"[,.;]|\s+y\s+|\s+o\s+|\s+que\s+", term)[0].strip()
+            if term:
+                ingredient_limit_filters.append({"mode": mode, "term": term})
+
     name_terms = extract_name_terms_from_query(query_norm, available_nutrients)
 
     return {
@@ -1170,6 +1183,7 @@ def parse_query_constraints(query: str, available_nutrients: List[str]) -> Dict[
         "prefer_low_price": prefer_low_price,
         "include_ingredients": include_ingredients,
         "exclude_ingredients": exclude_ingredients,
+        "ingredient_limit_filters": ingredient_limit_filters,
         "name_terms": name_terms,
     }
 
@@ -1347,6 +1361,25 @@ def apply_query_filters(
         filtered = filtered[mask]
         notes.append(f"Filtro de exclusión aplicado: sin '{term}'. Se mantienen {len(filtered)} de {previous} piensos.")
 
+    ingredient_limit_filters = query_constraints.get("ingredient_limit_filters", [])
+    for item in ingredient_limit_filters:
+        term = item.get("term", "")
+        mode = item.get("mode")
+        previous = len(filtered)
+        def _has_limit(feed_name: str) -> bool:
+            limits = details.get(feed_name, {}).get("ingredient_limits", {})
+            for ingredient_name, values in limits.items():
+                normalized_name = normalize_ascii(str(ingredient_name)).lower()
+                if term not in normalized_name:
+                    continue
+                numeric_value = safe_float(values.get(mode))
+                if numeric_value is not None:
+                    return True
+            return False
+        mask = filtered["feed_name"].apply(_has_limit)
+        filtered = filtered[mask]
+        label = "mínimos" if mode == "min" else "máximos"
+        notes.append(f"Filtro por límites {label} de ingrediente aplicado: '{term}'. Se mantienen {len(filtered)} de {previous} piensos.")
 
     name_terms = query_constraints.get("name_terms", [])
     if name_terms:
@@ -1862,45 +1895,165 @@ def render_manual_status(manual_entries: List[Dict[str, Any]], species: str) -> 
 
 
 
-def get_query_suggestions(species: str, selected_nutrients: List[str]) -> List[str]:
-    highlighted = ", ".join(nutrient_label(code) for code in selected_nutrients[:3])
-    if not highlighted:
-        highlighted = "los nutrientes seleccionados"
+def get_query_suggestions(
+    species: str,
+    selected_nutrients: List[str],
+    available_nutrients: List[str],
+    feeds_df: pd.DataFrame,
+    details: Dict[str, Any],
+    limit: int = 50,
+) -> List[str]:
+    nutrient_pool = [nutrient_label(code) for code in (selected_nutrients or available_nutrients)[:8]]
+    while len(nutrient_pool) < 4 and len(nutrient_pool) < len(available_nutrients):
+        nutrient_pool.append(nutrient_label(available_nutrients[len(nutrient_pool)]))
 
-    species_specific = {
-        "Porcino": [
-            "Busca piensos de gestantes con lisina >= 0.70 y precio <= 290.",
-            "Quiero los mejores piensos de crecimiento con proteína alta, energía alta y el menor precio posible.",
-            "Filtra fórmulas de acabado que cumplan calcio entre 0.60 y 0.80 y fósforo >= 0.45.",
-        ],
-        "Avicultura": [
-            "Quiero piensos con EMAn alta, lisina alta y precio bajo.",
-            "Busca fórmulas que cumplan calcio entre 0.80 y 0.95 y metionina >= 0.45.",
-            "Muéstrame los productos que mejor encajan con proteína alta y fibra baja.",
-        ],
-        "Rumiantes de carne": [
-            "Busca fórmulas con proteína alta, FND moderada y precio bajo.",
-            "Quiero productos que cumplan calcio entre 0.70 y 1.10 y energía alta.",
-            "Filtra piensos con almidón alto y proteína suficiente.",
-        ],
-        "Rumiantes de leche": [
-            "Busca piensos con proteína alta, FND suficiente y buen ajuste mineral.",
-            "Quiero fórmulas con calcio entre 0.80 y 1.10 y fósforo >= 0.40.",
-            "Muéstrame las opciones más económicas sin perder proteína.",
-        ],
-        "Reposición de rumiantes": [
-            "Busca fórmulas de recría con proteína alta y calcio suficiente.",
-            "Quiero piensos con energía alta y precio bajo.",
-            "Filtra productos con fósforo >= 0.40 y fibra moderada.",
-        ],
-    }
+    sample_feeds = feeds_df["feed_name"].dropna().astype(str).head(8).tolist() if "feed_name" in feeds_df.columns else []
 
-    generic = [
-        f"Ordena el Excel usando sobre todo {highlighted}.",
-        "Busca un producto barato que además cumpla mis límites de nutrientes.",
-        "Filtra por el nombre del producto o por ingredientes y luego ordénalo por aptitud.",
+    ingredient_counter: Dict[str, int] = {}
+    for feed_name in list(details.keys())[: min(len(details), 80)]:
+        for item in details.get(feed_name, {}).get("ingredients", [])[:40]:
+            ing_name = str(item.get("ingredient_name", "")).strip()
+            if not ing_name:
+                continue
+            key = normalize_ascii(ing_name).lower()
+            ingredient_counter[key] = ingredient_counter.get(key, 0) + 1
+    sample_ingredients = [
+        next(
+            str(item.get("ingredient_name", "")).strip()
+            for feed_name in details
+            for item in details.get(feed_name, {}).get("ingredients", [])
+            if normalize_ascii(str(item.get("ingredient_name", "")).strip()).lower() == key
+        )
+        for key, _ in sorted(ingredient_counter.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
     ]
-    return species_specific.get(species, []) + generic
+
+    species_terms = {
+        "Porcino": ["crecimiento", "acabado", "gestación", "lactación"],
+        "Avicultura": ["iniciación", "crecimiento", "acabado", "puesta"],
+        "Rumiantes de carne": ["cebo", "arranque", "acabado", "transición"],
+        "Rumiantes de leche": ["lactación", "transición", "alta producción", "secado"],
+        "Reposición de rumiantes": ["starter", "recría", "crecimiento", "preparto"],
+    }.get(species, [species.lower()])
+
+    templates: List[str] = []
+    price_limit = 300
+    for phase in species_terms:
+        templates.append(f"Busca piensos para {phase} con precio <= {price_limit} y ordénalos por precio ascendente.")
+        templates.append(f"Busca piensos para {phase} con proteína alta y precio <= {price_limit}.")
+        if nutrient_pool:
+            templates.append(f"Busca piensos para {phase} con {nutrient_pool[0]} >= 0.70 y precio <= {price_limit}.")
+        if len(nutrient_pool) > 1:
+            templates.append(f"Busca piensos para {phase} con {nutrient_pool[0]} alta y {nutrient_pool[1]} alta.")
+        if len(nutrient_pool) > 2:
+            templates.append(f"Busca piensos para {phase} con {nutrient_pool[2]} baja y buen precio.")
+
+    for nutrient in nutrient_pool[:6]:
+        templates.append(f"Ordena el Excel priorizando {nutrient} y después el precio más bajo.")
+        templates.append(f"Filtra piensos con {nutrient} >= 0.50 y devuelve el top 10.")
+        templates.append(f"Muéstrame los piensos con {nutrient} más alto y compara el precio.")
+
+    for nutrient_a, nutrient_b in zip(nutrient_pool[:4], nutrient_pool[1:5]):
+        templates.append(f"Busca piensos con {nutrient_a} alta y {nutrient_b} alta, priorizando el menor precio.")
+        templates.append(f"Busca piensos con {nutrient_a} entre 0.60 y 0.90 y {nutrient_b} >= 0.40.")
+
+    for ingredient in sample_ingredients[:6]:
+        templates.append(f"Busca piensos con {ingredient} en la fórmula y ordénalos por precio.")
+        templates.append(f"Busca piensos sin {ingredient} y prioriza {nutrient_pool[0] if nutrient_pool else 'los nutrientes seleccionados'}.")
+        templates.append(f"Filtra piensos con límites mínimos de {ingredient} en la fórmula.")
+
+    for feed_name in sample_feeds[:10]:
+        templates.append(f"Busca por nombre del pienso: {feed_name}.")
+        templates.append(f"Muéstrame el detalle y la comparación nutricional del pienso {feed_name}.")
+
+    templates.extend(
+        [
+            "Busca un producto barato que además cumpla mis límites de nutrientes.",
+            "Filtra por el nombre del producto o por ingredientes y luego ordénalo por aptitud.",
+            "Devuélveme solo piensos que cumplan exactamente los límites numéricos escritos en la consulta.",
+            "Quiero todos los productos cuyo nombre contenga starter o arranque.",
+            "Compara varios piensos seleccionados manualmente y muestra siempre el precio.",
+            "Busca los piensos con más proteína y menos precio.",
+            "Busca los piensos con más energía y menos precio.",
+            "Busca piensos que cumplan calcio entre 0.80 y 1.10 y fósforo >= 0.40.",
+            "Busca piensos con lisina alta, proteína alta y precio bajo.",
+            "Busca piensos con fibra moderada y buen precio.",
+        ]
+    )
+
+    unique_templates: List[str] = []
+    seen = set()
+    for item in templates:
+        clean = " ".join(str(item).split())
+        if clean and clean not in seen:
+            seen.add(clean)
+            unique_templates.append(clean)
+        if len(unique_templates) >= limit:
+            break
+
+    filler_index = 1
+    while len(unique_templates) < limit:
+        dynamic_nutrient = nutrient_pool[(filler_index - 1) % max(len(nutrient_pool), 1)] if nutrient_pool else "el nutriente seleccionado"
+        unique_templates.append(
+            f"Propuesta editable {filler_index}: filtra por {dynamic_nutrient}, ajusta el precio y revisa el top {min(10, max(3, filler_index % 10 + 1))}."
+        )
+        filler_index += 1
+    return unique_templates[:limit]
+
+
+
+def build_selected_feed_comparison(
+    selected_feed_names: List[str],
+    feeds_df: pd.DataFrame,
+    details: Dict[str, Any],
+    selected_nutrients: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not selected_feed_names:
+        return pd.DataFrame(), pd.DataFrame()
+
+    subset = feeds_df[feeds_df["feed_name"].isin(selected_feed_names)].copy()
+    if subset.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    subset["__order__"] = pd.Categorical(subset["feed_name"], categories=selected_feed_names, ordered=True)
+    subset = subset.sort_values("__order__").drop(columns="__order__")
+
+    comparison_cols = ["feed_name", "price"] + [n for n in selected_nutrients if n in subset.columns]
+    nutrient_df = subset[comparison_cols].rename(columns={"feed_name": "Pienso", "price": "Precio"}).copy()
+    nutrient_df = nutrient_df.rename(columns={code: nutrient_label(code) for code in selected_nutrients if code in nutrient_df.columns})
+
+    ingredient_names = sorted(
+        {
+            str(item.get("ingredient_name", "")).strip()
+            for feed_name in selected_feed_names
+            for item in details.get(feed_name, {}).get("ingredients", [])
+            if str(item.get("ingredient_name", "")).strip()
+        }
+    )
+    if not ingredient_names:
+        return nutrient_df, pd.DataFrame()
+
+    ingredient_rows: List[Dict[str, Any]] = []
+    for ingredient in ingredient_names:
+        row: Dict[str, Any] = {"Ingrediente": ingredient}
+        present_somewhere = False
+        for feed_name in selected_feed_names:
+            ingredients = details.get(feed_name, {}).get("ingredients", [])
+            match = next((item for item in ingredients if str(item.get("ingredient_name", "")).strip() == ingredient), None)
+            if match is None:
+                row[feed_name] = np.nan
+                continue
+            present_somewhere = True
+            pct_value = safe_float(match.get("pct"))
+            row[feed_name] = pct_value
+        if present_somewhere:
+            ingredient_rows.append(row)
+
+    ingredient_df = pd.DataFrame(ingredient_rows)
+    if not ingredient_df.empty:
+        ingredient_df["Presente en nº piensos"] = ingredient_df[selected_feed_names].notna().sum(axis=1)
+        ingredient_df = ingredient_df.sort_values(["Presente en nº piensos", "Ingrediente"], ascending=[False, True]).reset_index(drop=True)
+    return nutrient_df, ingredient_df
+
 
 
 def reset_search_state(clear_query: bool = True) -> None:
@@ -1908,6 +2061,9 @@ def reset_search_state(clear_query: bool = True) -> None:
     st.session_state["last_result"] = None
     st.session_state["last_query"] = ""
     st.session_state["selected_feed_name"] = None
+    st.session_state["pending_query_prefill"] = None
+    st.session_state["selected_feed_compare"] = []
+    st.session_state.pop("proposal_selector", None)
     if clear_query:
         st.session_state["query_draft"] = ""
 
@@ -2006,6 +2162,8 @@ def init_session_state() -> None:
     st.session_state.setdefault("selected_feed_name", None)
     st.session_state.setdefault("pending_new_search", False)
     st.session_state.setdefault("pending_query_prefill", None)
+    st.session_state.setdefault("selected_feed_compare", [])
+    st.session_state.setdefault("proposal_selector", None)
 
 
 
@@ -2090,21 +2248,22 @@ def main() -> None:
         "La consulta es editable y visible. La app interpreta el chat para filtrar y ordenar el Excel; FEDNA solo se usa para añadir contexto técnico en la respuesta."
     )
 
-    suggestions = get_query_suggestions(species, selected_nutrients)
+    suggestions = get_query_suggestions(species, selected_nutrients, available_nutrients, feeds_df, details, limit=50)
     with st.container(border=True):
-        st.markdown("**1) Elige una propuesta editable**")
-        chosen_template = st.radio(
+        st.markdown("**1) Elige una propuesta editable (50 opciones)**")
+        chosen_template = st.selectbox(
             "Propuestas de consulta",
             options=suggestions,
             index=0 if suggestions else None,
-            help="Selecciona una propuesta y pulsa 'Usar propuesta'. Después puedes editarla libremente.",
+            key="proposal_selector",
+            help="Selecciona una de las 50 propuestas, pulsa 'Usar propuesta' y después edítala libremente.",
             label_visibility="visible",
         )
         proposal_col, helper_col = st.columns([1, 2])
         if proposal_col.button("Usar propuesta", use_container_width=True):
             queue_query_prefill(chosen_template or "")
             st.rerun()
-        helper_col.info("Estas propuestas sirven como punto de partida. El texto final siempre se edita en el cuadro inferior.")
+        helper_col.info("Estas propuestas sirven solo como borrador. Puedes cambiar nombres de piensos, ingredientes, nutrientes y cifras antes de buscar.")
 
         st.markdown("**2) Escribe o edita tu consulta**")
         st.text_area(
@@ -2116,6 +2275,16 @@ def main() -> None:
                 "con el menor precio posible y evitando trigo si aparece en la fórmula."
             ),
         )
+
+    st.subheader("Comparativa directa de piensos")
+    st.caption("Selecciona varios piensos de toda la base de datos para compararlos por fórmula, nutrientes seleccionados y precio.")
+    compare_selection = st.multiselect(
+        "Selecciona uno o varios piensos de la base de datos",
+        options=feeds_df["feed_name"].dropna().astype(str).tolist(),
+        default=st.session_state.get("selected_feed_compare", []),
+        key="selected_feed_compare",
+        max_selections=12,
+    )
 
     action_col1, action_col2, action_col3, action_col4 = st.columns(4)
     run_query = action_col1.button("Buscar y rankear", type="primary", use_container_width=True)
@@ -2181,6 +2350,28 @@ def main() -> None:
         for message in st.session_state["chat_history"]:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+
+    compare_selection = st.session_state.get("selected_feed_compare", [])
+    if compare_selection:
+        nutrient_compare_df, ingredient_compare_df = build_selected_feed_comparison(
+            selected_feed_names=compare_selection,
+            feeds_df=feeds_df,
+            details=details,
+            selected_nutrients=selected_nutrients,
+        )
+        st.divider()
+        st.subheader("Comparativa de los piensos seleccionados")
+        if not nutrient_compare_df.empty:
+            st.markdown("**Nutrientes seleccionados y precio**")
+            st.dataframe(nutrient_compare_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No se pudo construir la comparativa de nutrientes para la selección actual.")
+
+        if not ingredient_compare_df.empty:
+            st.markdown("**Comparativa de fórmula por ingredientes (% inclusión)**")
+            st.dataframe(ingredient_compare_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No hay desglose de ingredientes suficiente para comparar las fórmulas seleccionadas.")
 
     last_result = st.session_state.get("last_result")
     if not last_result:
